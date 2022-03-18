@@ -16,10 +16,14 @@ limitations under the License.
 
 #include <sys/mman.h>
 
+#include <algorithm>
 #include <initializer_list>
 
 #include <gtest/gtest.h>
 #include "tensorflow/lite/c/common.h"
+#include "tensorflow/lite/context_util.h"
+#include "tensorflow/lite/delegates/nnapi/nnapi_delegate_kernel.h"
+#include "tensorflow/lite/delegates/nnapi/nnapi_delegate_plugin.h"
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/kernels/test_util.h"
 #include "tensorflow/lite/model.h"
@@ -47,12 +51,12 @@ MATCHER(QuantizedNear, "") {
 
 class SingleOpModelWithNNAPI : public SingleOpModel {
  public:
-  SingleOpModelWithNNAPI() { SetDelegate(NnApiDelegate()); }
+  SingleOpModelWithNNAPI() { options_.disallow_nnapi_cpu = false; }
 
   explicit SingleOpModelWithNNAPI(
       const StatefulNnApiDelegate::Options& options) {
-    stateful_delegate_.reset(new StatefulNnApiDelegate(options));
-    SetDelegate(stateful_delegate_.get());
+    options_ = options;
+    options_.disallow_nnapi_cpu = false;
   }
 
   TfLiteStatus ResizeInputTensor(int tensor_index,
@@ -66,7 +70,21 @@ class SingleOpModelWithNNAPI : public SingleOpModel {
     interpreter_->SetBufferHandle(index, handle, stateful_delegate_.get());
   }
 
+  void MarkInputTensorDataStale(int index) {
+    interpreter_->tensor(index)->data_is_stale = true;
+  }
+
   TfLiteStatus AllocateTensors() { return interpreter_->AllocateTensors(); }
+
+  void SetTensorMaxSize(uint32_t tensor_index, size_t max_size) {
+    options_.tensor_max_size_hints.emplace(tensor_index, max_size);
+  }
+
+  void ApplyNNAPIDelegate() {
+    stateful_delegate_.reset(new StatefulNnApiDelegate(options_));
+    SetDelegate(stateful_delegate_.get());
+    ApplyDelegate();
+  }
 
  protected:
   void SetData(int index, TensorType type, const std::vector<float>& data) {
@@ -104,9 +122,24 @@ class SingleOpModelWithNNAPI : public SingleOpModel {
     }
   }
 
+  void BuildInterpreterWithNNAPI(std::vector<std::vector<int>> input_shapes,
+                                 bool allow_fp32_relax_to_fp16 = false,
+                                 bool apply_delegate = true) {
+    // We skip those TfLite delegates that are applied by default in TfLite
+    // runtime by setting 'apply_delegate' to false. Afterwards, we explicitly
+    // call ApplyDelegate to apply the NNAPI delegate to meet the testing
+    // purpose.
+    BuildInterpreter(input_shapes, /*num_threads=*/-1, allow_fp32_relax_to_fp16,
+                     /*apply_delegate=*/false, /*allocate_and_delegate=*/true);
+    if (apply_delegate) {
+      ApplyNNAPIDelegate();
+    }
+  }
+
  private:
   // Stateful NNAPI delegate. This is valid only if the state-ful constructor is
   // used.
+  StatefulNnApiDelegate::Options options_;
   std::unique_ptr<StatefulNnApiDelegate> stateful_delegate_;
 };
 
@@ -148,8 +181,8 @@ class FloatAddOpModel : public SingleOpModelWithNNAPI {
     output_ = AddOutput(output);
     SetBuiltinOp(BuiltinOperator_ADD, BuiltinOptions_AddOptions,
                  CreateAddOptions(builder_, activation_type).Union());
-    BuildInterpreter({GetShape(input1_), GetShape(input2_)}, /*num_threads=*/-1,
-                     allow_fp32_relax_to_fp16, /*apply_delegate=*/true);
+    BuildInterpreterWithNNAPI({GetShape(input1_), GetShape(input2_)},
+                              allow_fp32_relax_to_fp16);
   }
 };
 
@@ -225,6 +258,7 @@ TEST(NNAPIDelegate, ResizeInputTensorsWorks) {
 TEST(NNAPIDelegate, ResizeDynamicBatchInputTensorsWorks) {
   StatefulNnApiDelegate::Options options;
   options.allow_dynamic_dimensions = true;
+  options.max_execution_cache_size = 1;
 
   FloatAddOpModel m(options,
                     {TensorType_FLOAT32, /*shape=*/{1, 3, 2, 1}, /*min=*/0.0f,
@@ -255,21 +289,38 @@ TEST(NNAPIDelegate, ResizeDynamicBatchInputTensorsWorks) {
                      /*block_size=*/{}, /*block_map=*/{},
                      /*shape_signature=*/{1, -1, 2, 1}},
                     ActivationFunctionType_NONE);
-  EXPECT_EQ(m.ResizeInputTensor(m.input1(), {1, 3, 2, 1}), kTfLiteOk);
-  EXPECT_EQ(m.ResizeInputTensor(m.input2(), {1, 3, 2, 1}), kTfLiteOk);
-  EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
-  m.PopulateTensor<float>(m.input1(), {-2.0, 0.2, 0.7, 0.8, 0.9, 0.7});
-  m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5, 0.2, 0.8});
-  m.Invoke();
-  EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9, 0.4, 1.0, 1.3, 1.1, 1.5}));
 
-  EXPECT_EQ(m.ResizeInputTensor(m.input1(), {1, 2, 2, 1}), kTfLiteOk);
-  EXPECT_EQ(m.ResizeInputTensor(m.input2(), {1, 2, 2, 1}), kTfLiteOk);
-  EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
-  m.PopulateTensor<float>(m.input1(), {0.7, 0.8, 0.9, 0.7});
-  m.PopulateTensor<float>(m.input2(), {0.3, 0.5, 0.2, 0.8});
-  m.Invoke();
-  EXPECT_THAT(m.GetOutput(), ElementsAreArray({1.0, 1.3, 1.1, 1.5}));
+  // Define 2 test cases, each with a different dynamic dimension value.
+  auto RunTestCase1 = [&m]() {
+    EXPECT_EQ(m.ResizeInputTensor(m.input1(), {1, 3, 2, 1}), kTfLiteOk);
+    EXPECT_EQ(m.ResizeInputTensor(m.input2(), {1, 3, 2, 1}), kTfLiteOk);
+    EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
+    m.PopulateTensor<float>(m.input1(), {-2.0, 0.2, 0.7, 0.8, 0.9, 0.7});
+    m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5, 0.2, 0.8});
+    m.Invoke();
+    EXPECT_THAT(m.GetOutput(),
+                ElementsAreArray({-1.9, 0.4, 1.0, 1.3, 1.1, 1.5}));
+  };
+  auto RunTestCase2 = [&m]() {
+    EXPECT_EQ(m.ResizeInputTensor(m.input1(), {1, 2, 2, 1}), kTfLiteOk);
+    EXPECT_EQ(m.ResizeInputTensor(m.input2(), {1, 2, 2, 1}), kTfLiteOk);
+    EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
+    m.PopulateTensor<float>(m.input1(), {0.7, 0.8, 0.9, 0.7});
+    m.PopulateTensor<float>(m.input2(), {0.3, 0.5, 0.2, 0.8});
+    m.Invoke();
+    EXPECT_THAT(m.GetOutput(), ElementsAreArray({1.0, 1.3, 1.1, 1.5}));
+  };
+
+  // TODO(b/221070667): Find a way to test whether the execution has indeed been
+  // reused or not.
+  // This will create a new execution for case 1.
+  RunTestCase1();
+  // This will reuse the execution for case 1.
+  RunTestCase1();
+  // This will destroy case 1, and create a new execution for case 2.
+  RunTestCase2();
+  // This will destroy case 2, and create a new execution for case 1.
+  RunTestCase1();
 }
 
 // Sanity check for the state-ful NNAPI delegate.
@@ -373,7 +424,11 @@ TEST(NNAPIDelegate, StatefulDelegateWithBufferHandles) {
       !NnApiImplementation()->ANeuralNetworksMemory_createFromFd) {
     GTEST_SKIP();
   }
+
   StatefulNnApiDelegate::Options options;
+  // Allow NNAPI CPU fallback path.
+  options.disallow_nnapi_cpu = false;
+  options.max_execution_cache_size = 2;
   FloatAddOpModel m(options, {TensorType_FLOAT32, {1, 2, 2, 1}},
                     {TensorType_FLOAT32, {1, 2, 2, 1}},
                     {TensorType_FLOAT32, {}}, ActivationFunctionType_NONE);
@@ -420,10 +475,24 @@ TEST(NNAPIDelegate, StatefulDelegateWithBufferHandles) {
   auto input1_handle = delegate->RegisterNnapiMemory(
       input1_memory, memory_callback, &memory_context);
   m.SetBufferHandle(m.input1(), input1_handle);
+  m.MarkInputTensorDataStale(m.input1());
   m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5});
   m.Invoke();
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9, 0.4, 1.0, 1.3}));
+
+  // Run the inference multiple times with the same buffer so that the execution
+  // can be reused.
+  for (int i = 0; i < 10; i++) {
+    // Change the value a little bit.
+    input1_data[0] = -2.0 + i;
+    memcpy(input1_memory_data, input1_data, kInput1ByteSize);
+    m.MarkInputTensorDataStale(m.input1());
+    m.Invoke();
+    EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9 + i, 0.4, 1.0, 1.3}));
+  }
+
   // Run the inference multiple times and each time register a buffer.
+  // Each will destroy the previous cache and create a new execution.
   for (int i = 0; i < 10; i++) {
     // Change the value a little bit.
     input1_data[0] = -2.0 + i;
@@ -431,6 +500,7 @@ TEST(NNAPIDelegate, StatefulDelegateWithBufferHandles) {
     auto input1_handle = delegate->RegisterNnapiMemory(
         input1_memory, memory_callback, &memory_context);
     m.SetBufferHandle(m.input1(), input1_handle);
+    m.MarkInputTensorDataStale(m.input1());
     m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5});
     m.Invoke();
     EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9 + i, 0.4, 1.0, 1.3}));
@@ -447,7 +517,7 @@ class FloatMulOpModel : public SingleOpModelWithNNAPI {
     output_ = AddOutput(output);
     SetBuiltinOp(BuiltinOperator_MUL, BuiltinOptions_MulOptions,
                  CreateMulOptions(builder_, activation_type).Union());
-    BuildInterpreter({GetShape(input1_), GetShape(input2_)});
+    BuildInterpreterWithNNAPI({GetShape(input1_), GetShape(input2_)});
   }
 
   int input1() { return input1_; }
@@ -486,7 +556,7 @@ class FloatPoolingOpModel : public SingleOpModelWithNNAPI {
                             filter_height, ActivationFunctionType_NONE)
             .Union());
 
-    BuildInterpreter({GetShape(input_)});
+    BuildInterpreterWithNNAPI({GetShape(input_)});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -571,7 +641,8 @@ class ConvolutionOpModel : public SingleOpModelWithNNAPI {
                      dilation_width_factor, dilation_height_factor)
                      .Union());
 
-    BuildInterpreter({GetShape(input_), GetShape(filter_), GetShape(bias_)});
+    BuildInterpreterWithNNAPI(
+        {GetShape(input_), GetShape(filter_), GetShape(bias_)});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -940,7 +1011,8 @@ class PerChannelQuantizedConvolutionWithConstantFilterOpModel
                      dilation_width_factor, dilation_height_factor)
                      .Union());
 
-    BuildInterpreter({GetShape(input_), GetShape(filter_), GetShape(bias_)});
+    BuildInterpreterWithNNAPI(
+        {GetShape(input_), GetShape(filter_), GetShape(bias_)});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -1037,7 +1109,8 @@ class DepthwiseConvolutionOpModel : public SingleOpModelWithNNAPI {
                                      ActivationFunctionType_NONE)
             .Union());
 
-    BuildInterpreter({GetShape(input_), GetShape(filter_), GetShape(bias_)});
+    BuildInterpreterWithNNAPI(
+        {GetShape(input_), GetShape(filter_), GetShape(bias_)});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -1161,7 +1234,8 @@ class FullyConnectedOpModel : public SingleOpModelWithNNAPI {
     SetBuiltinOp(BuiltinOperator_FULLY_CONNECTED,
                  BuiltinOptions_FullyConnectedOptions,
                  CreateFullyConnectedOptions(builder_, activation).Union());
-    BuildInterpreter({GetShape(input_), GetShape(weights_), GetShape(bias_)});
+    BuildInterpreterWithNNAPI(
+        {GetShape(input_), GetShape(weights_), GetShape(bias_)});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -1274,7 +1348,7 @@ class SoftmaxOpModel : public SingleOpModelWithNNAPI {
     output_ = AddOutput(input);
     SetBuiltinOp(BuiltinOperator_SOFTMAX, BuiltinOptions_SoftmaxOptions,
                  CreateSoftmaxOptions(builder_, beta).Union());
-    BuildInterpreter({GetShape(input_)});
+    BuildInterpreterWithNNAPI({GetShape(input_)});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -1378,7 +1452,8 @@ class ReshapeOpModel : public SingleOpModelWithNNAPI {
         BuiltinOperator_RESHAPE, BuiltinOptions_ReshapeOptions,
         CreateReshapeOptions(builder_, builder_.CreateVector<int>(new_shape))
             .Union());
-    BuildInterpreter({input_shape, {static_cast<int>(new_shape.size())}});
+    BuildInterpreterWithNNAPI(
+        {input_shape, {static_cast<int>(new_shape.size())}});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -1411,7 +1486,7 @@ class SqueezeOpModel : public SingleOpModelWithNNAPI {
         BuiltinOperator_SQUEEZE, BuiltinOptions_SqueezeOptions,
         CreateSqueezeOptions(builder_, builder_.CreateVector<int>(axis))
             .Union());
-    BuildInterpreter({GetShape(input_)});
+    BuildInterpreterWithNNAPI({GetShape(input_)});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -1467,7 +1542,7 @@ class L2NormOpModel : public SingleOpModelWithNNAPI {
     output_ = AddOutput(output);
     SetBuiltinOp(BuiltinOperator_L2_NORMALIZATION, BuiltinOptions_L2NormOptions,
                  CreateL2NormOptions(builder_, activation_type).Union());
-    BuildInterpreter({GetShape(input_)});
+    BuildInterpreterWithNNAPI({GetShape(input_)});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -1504,7 +1579,7 @@ class TransposeSimpleModel : public SingleOpModelWithNNAPI {
     output_ = AddOutput(TensorType_FLOAT32);
     SetBuiltinOp(BuiltinOperator_TRANSPOSE, BuiltinOptions_TransposeOptions,
                  CreateTransposeOptions(builder_).Union());
-    BuildInterpreter({input_shape, perm_shape});
+    BuildInterpreterWithNNAPI({input_shape, perm_shape});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -1548,7 +1623,7 @@ class ElementwiseOpFloatModel : public ElementwiseOpBaseModel {
     input_ = AddInput(TensorType_FLOAT32);
     output_ = AddOutput(TensorType_FLOAT32);
     SetBuiltinOp(op, BuiltinOptions_NONE, 0);
-    BuildInterpreter({input_shape});
+    BuildInterpreterWithNNAPI({input_shape});
   }
 };
 
@@ -1622,7 +1697,7 @@ class FloatSubOpModel : public SingleOpModelWithNNAPI {
     output_ = AddOutput(output);
     SetBuiltinOp(BuiltinOperator_SUB, BuiltinOptions_SubOptions,
                  CreateMulOptions(builder_, activation_type).Union());
-    BuildInterpreter({GetShape(input1_), GetShape(input2_)});
+    BuildInterpreterWithNNAPI({GetShape(input1_), GetShape(input2_)});
   }
 
   int input1() { return input1_; }
@@ -1657,7 +1732,7 @@ class FloatDivOpModel : public SingleOpModelWithNNAPI {
     output_ = AddOutput(output);
     SetBuiltinOp(BuiltinOperator_DIV, BuiltinOptions_DivOptions,
                  CreateMulOptions(builder_, activation_type).Union());
-    BuildInterpreter({GetShape(input1_), GetShape(input2_)});
+    BuildInterpreterWithNNAPI({GetShape(input1_), GetShape(input2_)});
   }
 
   int input1() { return input1_; }
@@ -1697,7 +1772,7 @@ class BaseConcatenationOpModel : public SingleOpModelWithNNAPI {
         BuiltinOperator_CONCATENATION, BuiltinOptions_ConcatenationOptions,
         CreateConcatenationOptions(builder_, axis, ActivationFunctionType_NONE)
             .Union());
-    BuildInterpreter(all_input_shapes);
+    BuildInterpreterWithNNAPI(all_input_shapes);
   }
 
  protected:
@@ -1754,7 +1829,7 @@ class QuantizedConcatenationOpModel : public BaseConcatenationOpModel {
         BuiltinOperator_CONCATENATION, BuiltinOptions_ConcatenationOptions,
         CreateConcatenationOptions(builder_, axis, ActivationFunctionType_NONE)
             .Union());
-    BuildInterpreter(all_input_shapes);
+    BuildInterpreterWithNNAPI(all_input_shapes);
   }
   void SetInput(int index, std::initializer_list<float> data) {
     QuantizeAndPopulate<uint8_t>(index, data);
@@ -1820,7 +1895,7 @@ class DequantizeOpModel : public SingleOpModelWithNNAPI {
     SetBuiltinOp(BuiltinOperator_DEQUANTIZE, BuiltinOptions_DequantizeOptions,
                  CreateDequantizeOptions(builder_).Union());
 
-    BuildInterpreter({GetShape(input_)});
+    BuildInterpreterWithNNAPI({GetShape(input_)});
   }
 
   template <typename T>
@@ -1862,7 +1937,7 @@ class FloorOpModel : public SingleOpModelWithNNAPI {
     input_ = AddInput(TensorType_FLOAT32);
     output_ = AddOutput(TensorType_FLOAT32);
     SetBuiltinOp(BuiltinOperator_FLOOR, BuiltinOptions_NONE, 0);
-    BuildInterpreter({
+    BuildInterpreterWithNNAPI({
         input_shape,
     });
   }
@@ -1916,7 +1991,7 @@ class LocalResponseNormOpModel : public SingleOpModelWithNNAPI {
                  CreateLocalResponseNormalizationOptions(builder_, radius, bias,
                                                          alpha, beta)
                      .Union());
-    BuildInterpreter({input_shape});
+    BuildInterpreterWithNNAPI({input_shape});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -1990,9 +2065,9 @@ class LSHProjectionOpModel : public SingleOpModelWithNNAPI {
                  BuiltinOptions_LSHProjectionOptions,
                  CreateLSHProjectionOptions(builder_, type).Union());
     if (weight_shape.size() > 0) {
-      BuildInterpreter({hash_shape, input_shape, weight_shape});
+      BuildInterpreterWithNNAPI({hash_shape, input_shape, weight_shape});
     } else {
-      BuildInterpreter({hash_shape, input_shape});
+      BuildInterpreterWithNNAPI({hash_shape, input_shape});
     }
 
     output_size_ = 1;
@@ -2033,7 +2108,13 @@ TEST(NNAPIDelegate, LSHProjectionDense1DInputs) {
 
   m.Invoke();
 
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  // Hash returns differently on machines with different endianness
+  EXPECT_THAT(m.GetOutput(), ElementsAre(0, 0, 1, 1, 1, 0));
+#else
   EXPECT_THAT(m.GetOutput(), ElementsAre(0, 0, 0, 1, 0, 0));
+#endif
 }
 
 TEST(NNAPIDelegate, LSHProjectionSparse1DInputs) {
@@ -2044,7 +2125,13 @@ TEST(NNAPIDelegate, LSHProjectionSparse1DInputs) {
 
   m.Invoke();
 
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  // Hash returns differently on machines with different endianness
+  EXPECT_THAT(m.GetOutput(), ElementsAre(0 + 0, 4 + 3, 8 + 2));
+#else
   EXPECT_THAT(m.GetOutput(), ElementsAre(0 + 0, 4 + 1, 8 + 0));
+#endif
 }
 
 TEST(NNAPIDelegate, LSHProjectionSparse3DInputs) {
@@ -2057,7 +2144,13 @@ TEST(NNAPIDelegate, LSHProjectionSparse3DInputs) {
 
   m.Invoke();
 
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  // Hash returns differently on machines with different endianness
+  EXPECT_THAT(m.GetOutput(), ElementsAre(0 + 0, 4 + 3, 8 + 2));
+#else
   EXPECT_THAT(m.GetOutput(), ElementsAre(0 + 2, 4 + 1, 8 + 1));
+#endif
 }
 
 class BaseActivationsOpModel : public SingleOpModelWithNNAPI {
@@ -2072,7 +2165,7 @@ class BaseActivationsOpModel : public SingleOpModelWithNNAPI {
       output_ = AddOutput({input.type, {}});
     }
     SetBuiltinOp(type, BuiltinOptions_NONE, 0);
-    BuildInterpreter({GetShape(input_)});
+    BuildInterpreterWithNNAPI({GetShape(input_)});
   }
 
   BaseActivationsOpModel(BuiltinOperator type, const TensorData& input,
@@ -2080,7 +2173,7 @@ class BaseActivationsOpModel : public SingleOpModelWithNNAPI {
     input_ = AddInput(input);
     output_ = AddOutput(output);
     SetBuiltinOp(type, BuiltinOptions_NONE, 0);
-    BuildInterpreter({GetShape(input_)});
+    BuildInterpreterWithNNAPI({GetShape(input_)});
   }
 
  protected:
@@ -2213,9 +2306,9 @@ class ResizeBilinearOpModel : public SingleOpModelWithNNAPI {
                  BuiltinOptions_ResizeBilinearOptions,
                  CreateResizeBilinearOptions(builder_).Union());
     if (const_size) {
-      BuildInterpreter({GetShape(input_)});
+      BuildInterpreterWithNNAPI({GetShape(input_)});
     } else {
-      BuildInterpreter({GetShape(input_), GetShape(size_)});
+      BuildInterpreterWithNNAPI({GetShape(input_), GetShape(size_)});
     }
   }
 
@@ -2349,7 +2442,7 @@ class PadOpConstModel : public PadOpModel<float> {
 
     SetBuiltinOp(BuiltinOperator_PAD, BuiltinOptions_PadOptions,
                  CreatePadOptions(builder_).Union());
-    BuildInterpreter({input.shape});
+    BuildInterpreterWithNNAPI({input.shape});
   }
 };
 
@@ -2401,7 +2494,7 @@ class SpaceToBatchNDOpConstModel : public SpaceToBatchNDOpModel {
     SetBuiltinOp(BuiltinOperator_SPACE_TO_BATCH_ND,
                  BuiltinOptions_SpaceToBatchNDOptions,
                  CreateSpaceToBatchNDOptions(builder_).Union());
-    BuildInterpreter({input_shape});
+    BuildInterpreterWithNNAPI({input_shape});
   }
 };
 
@@ -2469,7 +2562,8 @@ class StridedSliceOpModel : public SingleOpModelWithNNAPI {
         CreateStridedSliceOptions(builder_, begin_mask, end_mask, ellipsis_mask,
                                   new_axis_mask, shrink_axis_mask)
             .Union());
-    BuildInterpreter({input_shape, begin_shape, end_shape, strides_shape});
+    BuildInterpreterWithNNAPI(
+        {input_shape, begin_shape, end_shape, strides_shape});
   }
 
   void SetInput(std::initializer_list<input_type> data) {
@@ -2687,11 +2781,13 @@ class RNNOpModel : public SingleOpModelWithNNAPI {
     SetBuiltinOp(
         BuiltinOperator_RNN, BuiltinOptions_RNNOptions,
         CreateRNNOptions(builder_, ActivationFunctionType_RELU).Union());
-    BuildInterpreter({{batches_, input_size_},  // input tensor
-                      {units_, input_size_},    // weights tensor
-                      {units_, units_},         // recurrent weights tensor
-                      {units_},                 // bias tensor
-                      {batches_, units_}});     // hidden state tensor
+    BuildInterpreterWithNNAPI({
+        {batches_, input_size_},  // input tensor
+        {units_, input_size_},    // weights tensor
+        {units_, units_},         // recurrent weights tensor
+        {units_},                 // bias tensor
+        {batches_, units_}        // hidden state tensor
+    });
   }
 
   void SetBias(std::initializer_list<float> f) { PopulateTensor(bias_, f); }
@@ -2878,7 +2974,7 @@ class BaseSVDFOpModel : public SingleOpModelWithNNAPI {
     SetBuiltinOp(
         BuiltinOperator_SVDF, BuiltinOptions_SVDFOptions,
         CreateSVDFOptions(builder_, rank, ActivationFunctionType_NONE).Union());
-    BuildInterpreter({
+    BuildInterpreterWithNNAPI({
         {batches_, input_size_},              // input tensor
         {units_ * rank, input_size_},         // weights_feature tensor
         {units_ * rank, memory_size_},        // weights_time tensor
@@ -3128,7 +3224,7 @@ class LSTMOpModel : public SingleOpModelWithNNAPI {
                  CreateLSTMOptions(builder_, ActivationFunctionType_TANH,
                                    cell_clip, proj_clip)
                      .Union());
-    BuildInterpreter(input_shapes);
+    BuildInterpreterWithNNAPI(input_shapes);
   }
 
   void SetInputToInputWeights(const std::vector<float>& f) {
@@ -4628,7 +4724,7 @@ class MeanOpDynamicModel : public BaseReduceOpModel {
     output_ = AddOutput(output);
     SetBuiltinOp(BuiltinOperator_MEAN, BuiltinOptions_ReducerOptions,
                  CreateReducerOptions(builder_, keep_dims).Union());
-    BuildInterpreter({GetShape(input_)});
+    BuildInterpreterWithNNAPI({GetShape(input_)});
   }
 };
 
@@ -4658,7 +4754,7 @@ class MeanOpConstModel : public BaseReduceOpModel {
     output_ = AddOutput(output);
     SetBuiltinOp(BuiltinOperator_MEAN, BuiltinOptions_ReducerOptions,
                  CreateReducerOptions(builder_, keep_dims).Union());
-    BuildInterpreter({GetShape(input_)});
+    BuildInterpreterWithNNAPI({GetShape(input_)});
   }
 };
 
@@ -4697,7 +4793,7 @@ class BaseEmbeddingLookupOpModel : public SingleOpModelWithNNAPI {
     weight_ = AddInput(weight_type);
     output_ = AddOutput(TensorType_FLOAT32);
     SetBuiltinOp(BuiltinOperator_EMBEDDING_LOOKUP, BuiltinOptions_NONE, 0);
-    BuildInterpreter({index_shape, weight_shape});
+    BuildInterpreterWithNNAPI({index_shape, weight_shape});
   }
 
   void SetInput(std::initializer_list<int> data) {
@@ -4759,7 +4855,7 @@ class HashtableLookupOpModel : public SingleOpModelWithNNAPI {
     output_ = AddOutput(type);
     hit_ = AddOutput(TensorType_UINT8);
     SetBuiltinOp(BuiltinOperator_HASHTABLE_LOOKUP, BuiltinOptions_NONE, 0);
-    BuildInterpreter({lookup_shape, key_shape, value_shape});
+    BuildInterpreterWithNNAPI({lookup_shape, key_shape, value_shape});
   }
 
   void SetLookup(std::initializer_list<int> data) {
@@ -4871,7 +4967,7 @@ class PReluOpModel : public SingleOpModelWithNNAPI {
     alpha_ = AddInput(alpha);
     output_ = AddOutput({input.type, input.shape, input.min, input.max});
     SetBuiltinOp(BuiltinOperator_PRELU, BuiltinOptions_NONE, 0);
-    BuildInterpreter({GetShape(input_), GetShape(alpha_)});
+    BuildInterpreterWithNNAPI({GetShape(input_), GetShape(alpha_)});
   }
 
   void SetInput(std::initializer_list<float> data) {
@@ -4957,7 +5053,7 @@ class PadV2OpConstModel : public PadOpModel<T1> {
 
     this->SetBuiltinOp(BuiltinOperator_PADV2, BuiltinOptions_PadV2Options,
                        CreatePadV2Options(this->builder_).Union());
-    this->BuildInterpreter({input.shape});
+    this->BuildInterpreterWithNNAPI({input.shape});
   }
 
   PadV2OpConstModel(const TensorData& input,
@@ -4974,7 +5070,7 @@ class PadV2OpConstModel : public PadOpModel<T1> {
 
     this->SetBuiltinOp(BuiltinOperator_PADV2, BuiltinOptions_PadV2Options,
                        CreatePadV2Options(this->builder_).Union());
-    this->BuildInterpreter({input.shape});
+    this->BuildInterpreterWithNNAPI({input.shape});
   }
 };
 
@@ -4994,7 +5090,7 @@ class PadV2OpDynamicModel : public PadOpModel<RegularInputOutput> {
 
     this->SetBuiltinOp(BuiltinOperator_PADV2, BuiltinOptions_PadV2Options,
                        CreatePadV2Options(this->builder_).Union());
-    this->BuildInterpreter({input.shape, paddings_shape});
+    this->BuildInterpreterWithNNAPI({input.shape, paddings_shape});
   }
   PadV2OpDynamicModel(const TensorData& input,
                       std::initializer_list<int> paddings_shape,
@@ -5007,7 +5103,7 @@ class PadV2OpDynamicModel : public PadOpModel<RegularInputOutput> {
 
     this->SetBuiltinOp(BuiltinOperator_PADV2, BuiltinOptions_PadV2Options,
                        CreatePadV2Options(this->builder_).Union());
-    this->BuildInterpreter({input.shape, paddings_shape});
+    this->BuildInterpreterWithNNAPI({input.shape, paddings_shape});
   }
 };
 
@@ -5290,11 +5386,292 @@ TEST(QuantizedPadV2OpTest, Int8AdvancedDynamicValuedTest) {
   AdvancedDynamicValuedTest<int8_t, TensorType_INT8>();
 }
 
+// A base class of Leaky ReLU op model. It provides the constructor for
+// FloatLeakyReluOpModel and QuantizedLeakyReluOpModel.
+class LeakyReluOpModel : public SingleOpModelWithNNAPI {
+ public:
+  LeakyReluOpModel(const TensorData& input, const float& alpha)
+      : input_type_(input.type) {
+    input_ = AddInput(input);
+    output_ = AddOutput({input.type, input.shape, input.min, input.max});
+
+    SetBuiltinOp(BuiltinOperator_LEAKY_RELU, BuiltinOptions_LeakyReluOptions,
+                 CreateLeakyReluOptions(builder_, alpha).Union());
+    BuildInterpreterWithNNAPI({GetShape(input_)});
+  }
+
+  void SetInput(std::initializer_list<float> data) {
+    SetData(input_, input_type_, data);
+  }
+
+  std::vector<float> GetOutput() {
+    std::vector<float> output;
+    GetData(output_, input_type_, &output);
+    return output;
+  }
+
+ protected:
+  int input_;
+  int output_;
+
+  const TensorType input_type_;
+};
+
+TEST(NNAPIDelegate, LeakyReluFloat) {
+  LeakyReluOpModel m({TensorType_FLOAT32, {2, 3}}, 0.5f);
+
+  m.SetInput({
+      0.0f, 1.0f, 3.0f,    // Row 1
+      1.0f, -1.0f, -2.0f,  // Row 2
+  });
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({
+                                 0.0f, 1.0f, 3.0f,    // Row 1
+                                 1.0f, -0.5f, -1.0f,  // Row 2
+
+                             }));
+}
+
+TEST(NNAPIDelegate, LeakyReluQuantized) {
+  const float kMin = -1;
+  const float kMax = 127.f / 128.f;
+  LeakyReluOpModel m({TensorType_UINT8, {2, 3}, 8 * kMin, 8 * kMax}, 0.5f);
+  m.SetInput({
+      0.0f, 1.0f, 3.0f,    // Row 1
+      1.0f, -1.0f, -2.0f,  // Row 2
+  });
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
+                                 {
+                                     0.0f, 1.0f, 3.0f,    // Row 1
+                                     1.0f, -0.5f, -1.0f,  // Row 2
+                                 },
+                                 kQuantizedTolerance)));
+}
+}  // namespace
+
+namespace ops {
+namespace builtin {
+TfLiteRegistration* Register_FLOOR();
+}  // namespace builtin
+}  // namespace ops
+
+namespace {
+
+std::vector<uint32_t> GetNNAPIDimensions(const TfLiteTensor* tensor) {
+  std::vector<uint32_t> dimensions;
+  dimensions.reserve(tensor->dims->size);
+  if (tensor->dims_signature != nullptr &&
+      tensor->dims_signature->size == tensor->dims->size) {
+    for (auto d : TfLiteIntArrayView(tensor->dims_signature)) {
+      uint32_t nnapi_dim = (d == -1) ? 0 : static_cast<uint32_t>(d);
+      dimensions.push_back(nnapi_dim);
+    }
+  } else {
+    dimensions.assign(tensor->dims->data,
+                      tensor->dims->data + tensor->dims->size);
+  }
+  return dimensions;
+}
+
+// The "nnapi-custom-op" is just float32 floor.
+static const char kTestCustomOp[] = "nnapi-custom-op";
+class NnapiTestVendorPlugin : public NnapiDelegateVendorPlugin {
+ public:
+  NnapiTestVendorPlugin() {
+    ValidateNode = DoValidateNode;
+    MapNode = DoMapNode;
+    ConfigureCompilationHints = DoConfigureCompilationHints;
+    ConfigureExecutionHints = DoConfigureExecutionHints;
+  }
+
+  static bool DoValidateNode(const TfLiteContext* context,
+                             const TfLiteRegistration* registration,
+                             const TfLiteNode* node) {
+    if (strcmp(kTestCustomOp, registration->custom_name) != 0) {
+      return false;
+    }
+    if (node->inputs->size != 1 || node->outputs->size != 1) {
+      return false;
+    }
+    if (context->tensors[node->inputs->data[(0)]].type != kTfLiteFloat32 ||
+        context->tensors[node->outputs->data[(0)]].type != kTfLiteFloat32) {
+      return false;
+    }
+    return true;
+  }
+
+  static TfLiteStatus AddFloat32Tensor(const TfLiteContext* context,
+                                       int tensor_index,
+                                       NnapiMappingUtilCInterface* mapping,
+                                       std::vector<uint32_t>* indices,
+                                       ANeuralNetworksModel* model) {
+    int ann_tensor_index = mapping->TfLiteIndexToNnIndex(mapping, tensor_index);
+    if (ann_tensor_index != -1) {
+      indices->push_back(ann_tensor_index);
+      return kTfLiteOk;
+    }
+    // Allocate a new tensor index
+    ann_tensor_index = mapping->AddNewNnTensorIndex(mapping, tensor_index);
+    TfLiteTensor* tensor = &context->tensors[tensor_index];
+    auto dimensions = GetNNAPIDimensions(tensor);
+    ANeuralNetworksOperandType operand_type{
+        .type = ANEURALNETWORKS_TENSOR_FLOAT32,
+        .dimensionCount = static_cast<uint32_t>(dimensions.size()),
+        .dimensions = dimensions.data(),
+        .scale = 0.0f,
+        .zeroPoint = 0,
+    };
+    EXPECT_EQ(NnApiImplementation()->ANeuralNetworksModel_addOperand(
+                  model, &operand_type),
+              ANEURALNETWORKS_NO_ERROR);
+    if (tensor->allocation_type == kTfLiteMmapRo) {
+      EXPECT_EQ(NnApiImplementation()->ANeuralNetworksModel_setOperandValue(
+                    model, ann_tensor_index, tensor->data.data, tensor->bytes),
+                ANEURALNETWORKS_NO_ERROR);
+    }
+    indices->push_back(ann_tensor_index);
+    return kTfLiteOk;
+  }
+
+  static TfLiteStatus DoMapNode(TfLiteContext* context, const TfLiteNode* node,
+                                int node_index,
+                                NnapiMappingUtilCInterface* mapping,
+                                ANeuralNetworksModel* model) {
+    std::vector<uint32_t> input_indices;
+    std::vector<uint32_t> output_indices;
+    for (int input_pos = 0; input_pos < node->inputs->size; ++input_pos) {
+      const auto input_index = node->inputs->data[input_pos];
+      EXPECT_EQ(AddFloat32Tensor(context, input_index, mapping, &input_indices,
+                                 model),
+                kTfLiteOk);
+    }
+    for (int output_pos = 0; output_pos < node->outputs->size; ++output_pos) {
+      const auto output_index = node->outputs->data[output_pos];
+      EXPECT_EQ(AddFloat32Tensor(context, output_index, mapping,
+                                 &output_indices, model),
+                kTfLiteOk);
+    }
+    EXPECT_EQ(
+        NnApiImplementation()->ANeuralNetworksModel_addOperation(
+            model, ANEURALNETWORKS_FLOOR,
+            static_cast<uint32_t>(input_indices.size()), input_indices.data(),
+            static_cast<uint32_t>(output_indices.size()),
+            output_indices.data()),
+        ANEURALNETWORKS_NO_ERROR);
+    mapping->AddNnapiToTfliteOpMapping(mapping, node_index);
+    return kTfLiteOk;
+  }
+
+  static TfLiteStatus DoConfigureCompilationHints(
+      const char* compilation_hints, ANeuralNetworksCompilation* compilation) {
+    return kTfLiteOk;
+  }
+
+  static TfLiteStatus DoConfigureExecutionHints(
+      const char* execution_hints, ANeuralNetworksExecution* execution) {
+    return kTfLiteOk;
+  }
+};
+
+class CustomFloorOpModel : public SingleOpModelWithNNAPI {
+ public:
+  CustomFloorOpModel(const StatefulNnApiDelegate::Options& options,
+                     const TensorData& input, const TensorData& output,
+                     bool allow_fp32_relax_to_fp16 = false,
+                     bool apply_delegate = true)
+      : SingleOpModelWithNNAPI(options) {
+    Init(input, output, allow_fp32_relax_to_fp16, apply_delegate);
+  }
+
+  int input() { return input_; }
+  int output() { return output_; }
+
+  std::vector<float> GetOutput() { return ExtractVector<float>(output_); }
+
+ protected:
+  int input_;
+  int output_;
+
+ private:
+  // Performs initialization logic shared across all constructors.
+  void Init(const TensorData& input, const TensorData& output,
+            bool allow_fp32_relax_to_fp16 = false, bool apply_delegate = true) {
+    input_ = AddInput(input);
+    output_ = AddOutput(output);
+    SetCustomOp(kTestCustomOp, {}, tflite::ops::builtin::Register_FLOOR);
+    BuildInterpreterWithNNAPI({GetShape(input_)}, allow_fp32_relax_to_fp16,
+                              apply_delegate);
+  }
+};
+
+TEST(NNAPIDelegate, CustomFloorVendorExtension) {
+  auto vendor_plugin = std::make_unique<NnapiTestVendorPlugin>();
+  StatefulNnApiDelegate::Options options;
+  options.accelerator_name = "nnapi-reference";
+  options.vendor_plugin = vendor_plugin.get();
+
+  CustomFloorOpModel m(options, {TensorType_FLOAT32, {1, 2, 2, 1}},
+                       {TensorType_FLOAT32, {1, 2, 2, 1}});
+  m.PopulateTensor<float>(m.input(), {0, 0.2, 1.7, 2.8});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({0.0, 0.0, 1.0, 2.0}));
+}
+
+TEST(NNAPIDelegate, CustomFloorVendorExtensionDynamic) {
+  // Models with dynamic dimensions and vendor plugin is not supported before
+  // NNAPI 1.2 (API level 29).
+  if (NnApiImplementation()->android_sdk_version <
+      delegate::nnapi::kMinSdkVersionForNNAPI12) {
+    GTEST_SKIP();
+  }
+
+  auto vendor_plugin = std::make_unique<NnapiTestVendorPlugin>();
+  StatefulNnApiDelegate::Options options;
+  options.accelerator_name = "nnapi-reference";
+  options.vendor_plugin = vendor_plugin.get();
+  options.allow_dynamic_dimensions = true;
+
+  // Both input and output tensors have dynamic batch.
+  auto tensor_data = TensorData{TensorType_FLOAT32,
+                                /*shape=*/{1, 2, 2, 1},
+                                /*min=*/0.0f,
+                                /*max=*/0.0f,
+                                /*scale=*/0.0f,
+                                /*zero_point=*/0,
+                                /*per_channel_quantization=*/false,
+                                /*per_channel_quantization_scales=*/{},
+                                /*per_channel_quantization_offsets=*/{},
+                                /*channel_index=*/0,
+                                /*traversal_order=*/{},
+                                /*format=*/{},
+                                /*block_size=*/{},
+                                /*block_map=*/{},
+                                /*shape_signature=*/{-1, 2, 2, 1}};
+  size_t max_batch_size = 2;
+  size_t tensor_max_size = max_batch_size * 2 * 2 * 1 * sizeof(float);
+  CustomFloorOpModel m(options, tensor_data, tensor_data,
+                       /*allow_fp32_relax_to_fp16=*/false,
+                       /*apply_delegate=*/false);
+  m.SetTensorMaxSize(m.input(), tensor_max_size);
+  m.SetTensorMaxSize(m.output(), tensor_max_size);
+  m.ApplyNNAPIDelegate();
+
+  // Try the max batch size.
+  EXPECT_EQ(m.ResizeInputTensor(m.input(), {2, 2, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
+  m.PopulateTensor<float>(m.input(), {0, 0.2, 1.7, 2.8, 3.4, 4.1, 5.9, 6.3});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(),
+              ElementsAreArray({0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0}));
+
+  // Try another batch size.
+  EXPECT_EQ(m.ResizeInputTensor(m.input(), {1, 2, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
+  m.PopulateTensor<float>(m.input(), {1.7, 2.8, 3.4, 4.1});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({1.0, 2.0, 3.0, 4.0}));
+}
+
 }  // namespace
 }  // namespace tflite
-
-int main(int argc, char** argv) {
-  ::tflite::LogToStderr();
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}
