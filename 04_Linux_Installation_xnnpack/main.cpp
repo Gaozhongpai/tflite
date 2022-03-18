@@ -1,5 +1,5 @@
-#include <tensorflow/lite/c/c_api.h>
-#include <tensorflow/lite/delegates/xnnpack/xnnpack_delegate.h>
+#include "tensorflow/lite/c/c_api.h"
+#include "tensorflow/lite/delegates/xnnpack/xnnpack_delegate.h"
 
 int main()
 {
