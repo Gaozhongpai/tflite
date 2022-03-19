@@ -3,7 +3,7 @@
 
 int main()
 {
-    auto m_model = TfLiteModelCreateFromFile("../../models/model.fp32.tflite");
+    auto m_model = TfLiteModelCreateFromFile("../../models/hand_mesh.tflite");
     auto m_options = TfLiteInterpreterOptionsCreate();
     TfLiteXNNPackDelegateOptions opt = TfLiteXNNPackDelegateOptionsDefault();
     auto m_xnnpack_delegate = TfLiteXNNPackDelegateCreate(&opt);
