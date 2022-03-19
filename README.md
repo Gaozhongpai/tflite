@@ -17,6 +17,7 @@ This Repository contains code and instruction for my TensorFlow Lite C++ ([youtu
 - ### TFlite C++ Linux Installation
 
     `bazel build --define tflite_with_xnnpack=true  -c opt //tensorflow/lite:libtensorflowlite.so`
+    `bazel build --define -c opt //tensorflow/lite/c:libtensorflowlite_c.so`
 
 - ### TFlite C++ Image Classification
 
